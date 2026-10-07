@@ -86,7 +86,15 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
             del self.named_modules_to_munmap[op_key]
         super().pin_weight_to_device(key)
 
-    mmap_released = False
+    # tracked on the model, since multigpu clones share a patcher lineage but not the weights
+    @property
+    def mmap_released(self):
+        return getattr(self.model, "gguf_mmap_released", False)
+
+    @mmap_released.setter
+    def mmap_released(self, value):
+        self.model.gguf_mmap_released = value
+
     named_modules_to_munmap = {}
 
     def load(self, *args, force_patch_weights=False, **kwargs):
@@ -127,10 +135,46 @@ class GGUFModelPatcher(comfy.model_patcher.ModelPatcher):
         self.__class__ = src_cls
         # GGUF specific clone values below
         n.patch_on_device = getattr(self, "patch_on_device", False)
-        n.mmap_released = getattr(self, "mmap_released", False)
         if src_cls != GGUFModelPatcher:
             n.size = 0 # force recalc
         return n
+
+def load_unet_gguf_patcher(unet_path, dequant_dtype=None, patch_dtype=None, patch_on_device=None, disable_dynamic=False):
+    ops = GGMLOps()
+
+    if dequant_dtype in ("default", None):
+        ops.Linear.dequant_dtype = None
+    elif dequant_dtype in ["target"]:
+        ops.Linear.dequant_dtype = dequant_dtype
+    else:
+        ops.Linear.dequant_dtype = getattr(torch, dequant_dtype)
+
+    if patch_dtype in ("default", None):
+        ops.Linear.patch_dtype = None
+    elif patch_dtype in ["target"]:
+        ops.Linear.patch_dtype = patch_dtype
+    else:
+        ops.Linear.patch_dtype = getattr(torch, patch_dtype)
+
+    # init model
+    sd, extra = gguf_sd_loader(unet_path)
+
+    kwargs = {}
+    valid_params = inspect.signature(comfy.sd.load_diffusion_model_state_dict).parameters
+    if "metadata" in valid_params:
+        kwargs["metadata"] = extra.get("metadata", {})
+
+    model = comfy.sd.load_diffusion_model_state_dict(
+        sd, model_options={"custom_operations": ops}, **kwargs,
+    )
+    if model is None:
+        logging.error("ERROR UNSUPPORTED UNET {}".format(unet_path))
+        raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
+    model = GGUFModelPatcher.clone(model)
+    model.patch_on_device = patch_on_device
+    # reload factory, lets comfy load a separate copy of the model per device (MultiGPU CFG Split, Select Model Device)
+    model.cached_patcher_init = (load_unet_gguf_patcher, (unet_path, dequant_dtype, patch_dtype, patch_on_device))
+    return model
 
 class UnetLoaderGGUF:
     @classmethod
@@ -148,40 +192,8 @@ class UnetLoaderGGUF:
     TITLE = "Unet Loader (GGUF)"
 
     def load_unet(self, unet_name, dequant_dtype=None, patch_dtype=None, patch_on_device=None):
-        ops = GGMLOps()
-
-        if dequant_dtype in ("default", None):
-            ops.Linear.dequant_dtype = None
-        elif dequant_dtype in ["target"]:
-            ops.Linear.dequant_dtype = dequant_dtype
-        else:
-            ops.Linear.dequant_dtype = getattr(torch, dequant_dtype)
-
-        if patch_dtype in ("default", None):
-            ops.Linear.patch_dtype = None
-        elif patch_dtype in ["target"]:
-            ops.Linear.patch_dtype = patch_dtype
-        else:
-            ops.Linear.patch_dtype = getattr(torch, patch_dtype)
-
-        # init model
         unet_path = folder_paths.get_full_path("unet", unet_name)
-        sd, extra = gguf_sd_loader(unet_path)
-
-        kwargs = {}
-        valid_params = inspect.signature(comfy.sd.load_diffusion_model_state_dict).parameters
-        if "metadata" in valid_params:
-            kwargs["metadata"] = extra.get("metadata", {})
-
-        model = comfy.sd.load_diffusion_model_state_dict(
-            sd, model_options={"custom_operations": ops}, **kwargs,
-        )
-        if model is None:
-            logging.error("ERROR UNSUPPORTED UNET {}".format(unet_path))
-            raise RuntimeError("ERROR: Could not detect model type of: {}".format(unet_path))
-        model = GGUFModelPatcher.clone(model)
-        model.patch_on_device = patch_on_device
-        return (model,)
+        return (load_unet_gguf_patcher(unet_path, dequant_dtype, patch_dtype, patch_on_device),)
 
 class UnetLoaderGGUFAdvanced(UnetLoaderGGUF):
     @classmethod

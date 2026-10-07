@@ -35,6 +35,16 @@ Simply use the GGUF Unet loader found under the `bootleg` category. Place the .g
 
 LoRA loading is experimental but it should work with just the built-in LoRA loader node(s).
 
+### Multi-GPU
+
+The GGUF Unet loaders work with the `MultiGPU CFG Split` node that ships with ComfyUI (`advanced/multigpu`). Place it after any other model nodes, right before the sampler:
+
+```
+Unet Loader (GGUF) -> [LoRA / model patch nodes] -> MultiGPU CFG Split -> KSampler
+```
+
+Each GPU gets its own copy of the model and the positive / negative prompts are evaluated in parallel, so this only helps when CFG is above 1.0 and every GPU has enough VRAM for the model. `Select Model Device` can also be used to move the model to a specific GPU.
+
 Pre-quantized models:
 
 - [flux1-dev GGUF](https://huggingface.co/city96/FLUX.1-dev-gguf)
